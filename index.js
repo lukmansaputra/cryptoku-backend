@@ -1,88 +1,55 @@
-import WebSocket from "ws";
-import dotenv from "dotenv";
-import { createClient } from "@supabase/supabase-js";
+// api/prices.js
 
-dotenv.config();
+import { createClient } from '@supabase/supabase-js';
 
-// =============================
-// CONFIG
-// =============================
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Pair yang ingin dimonitor
-const PAIRS = ["BTCUSDT", "ETHUSDT", "TONUSDT", "BNBUSDT"];
-
-// Interval simpan ke supabase (ms)
-const SAVE_INTERVAL = 15000;
-
-// Menampung harga realtime
-const priceStore = {};
-
-// =============================
-// CONNECT TO BINANCE WS
-// =============================
-function startWS() {
-  const stream = PAIRS.map((p) => `${p.toLowerCase()}@trade`).join("/");
-  const ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${stream}`);
-
-  ws.on("open", () => {
-    console.log("🔥 Connected to Binance WebSocket");
-  });
-
-  ws.on("message", (data) => {
-    try {
-      const json = JSON.parse(data);
-      const symbol = json?.data?.s;
-      const price = parseFloat(json?.data?.p);
-
-      if (!symbol || !price) return;
-
-      priceStore[symbol] = price;
-    } catch (err) {
-      console.error("Error parsing message:", err);
+export default async function handler(req, res) {
+    if (req.method !== 'GET') {
+        res.setHeader('Allow', ['GET']);
+        return res.status(405).json({ error: 'Method Not Allowed', message: 'Hanya method GET yang diizinkan.' });
     }
-  });
 
-  ws.on("close", () => {
-    console.log("⚠️ WS closed. Reconnecting in 3s...");
-    setTimeout(startWS, 3000);
-  });
+    try {
+        // LEFT JOIN crypto_24h untuk ambil 24h change
+        const { data, error } = await supabase
+            .from('crypto_prices')
+            .select(`
+                symbol,
+                price,
+                timestamp,
+                crypto_24h:crypto_24h (
+                    pricechangepercent,
+                    lastupdate
+                )
+            `)
+            .order('symbol', { ascending: true });
 
-  ws.on("error", (err) => {
-    console.error("❌ WS error:", err);
-    ws.close();
-  });
+        if (error) {
+            console.error('Supabase fetch error:', error);
+            return res.status(500).json({ error: 'Database Error', details: error.message });
+        }
+
+        // Format data supaya crypto_24h langsung ikut di object utama
+        const formatted = data.map(item => ({
+            symbol: item.symbol,
+            price: item.price,
+            timestamp: item.timestamp,
+            priceChangePercent: item.crypto_24h?.pricechangepercent || 0,
+            lastUpdate: item.crypto_24h?.lastupdate || null
+        }));
+
+        return res.status(200).json({ 
+            success: true,
+            count: formatted.length,
+            data: formatted
+        });
+
+    } catch (err) {
+        console.error('Internal server error:', err);
+        return res.status(500).json({ error: 'Internal Server Error', message: err.message });
+    }
 }
-
-startWS();
-
-// =============================
-// SAVE TO SUPABASE EVERY 15s
-// =============================
-async function savePrices() {
-  const entries = Object.entries(priceStore);
-
-  if (entries.length === 0) {
-    console.log("No price data yet...");
-    return;
-  }
-
-  const rows = entries.map(([symbol, price]) => ({
-    symbol,
-    price,
-  }));
-
-  const { error } = await supabase.from("prices").insert(rows);
-
-  if (error) {
-    console.error("❌ Failed to save prices:", error);
-  } else {
-    console.log("💾 Saved:", rows);
-  }
-}
-
-setInterval(savePrices, SAVE_INTERVAL);
-console.log("⏳ Saver interval running...");
